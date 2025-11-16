@@ -23,6 +23,9 @@
 # misc
 .DS_Store
 *.pem
+.kiro
+DESIGN_SYSTEM.md
+WEBSOCKET_INTEGRATION.md
 
 # debug
 npm-debug.log*

@@ -1,65 +1,411 @@
-import Image from "next/image";
+'use client';
 
+import { useState, useEffect, useRef } from 'react';
+import { DetectionFeed } from '@/components/detection/DetectionFeed';
+import { VehicleCounter } from '@/components/detection/VehicleCounter';
+import { InsightPanel } from '@/components/insights/InsightPanel';
+import { VideoUpload } from '@/components/upload/VideoUpload';
+import { Detection, convertBackendDetection } from '@/types/detection';
+import { VehicleCounts } from '@/types/session';
+import { Insight } from '@/types/insight';
+import { generateInsight } from '@/lib/mockData';
+import { ErrorBoundary } from '@/components/error/ErrorBoundary';
+import { VehicleCounterSkeleton } from '@/components/loading/SkeletonLoader';
+import { VehicleDetectionWebSocket } from '@/lib/websocket';
+import { SessionStorage } from '@/lib/storage';
+import { Wifi, WifiOff, Save } from 'lucide-react';
+
+/**
+ * Main Dashboard Page - Live Detection View
+ * Requirements: 1.1, 1.4, 5.5
+ * 
+ * Two-column responsive layout:
+ * - Left (70%): Real-time detection feed with bounding boxes
+ * - Right (30%): Vehicle counters and AI insights panel
+ * 
+ * Responsive breakpoints:
+ * - Mobile (< 768px): Stacked layout
+ * - Tablet (768px - 1024px): Adjusted proportions
+ * - Desktop (> 1024px): Two-column layout
+ */
 export default function Home() {
+  const [detections, setDetections] = useState<Detection[]>([]);
+  const [fps, setFps] = useState(0);
+  const [vehicleCounts, setVehicleCounts] = useState<VehicleCounts>({
+    cars: 0,
+    truckBus: 0,
+    motorcycle: 0,
+  });
+  const [insights, setInsights] = useState<Insight[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [feedError, setFeedError] = useState<string | null>(null);
+  const [isGeneratingInsight, setIsGeneratingInsight] = useState(false);
+  
+  // WebSocket state
+  const [isConnected, setIsConnected] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [videoSrc, setVideoSrc] = useState<string | null>(null);
+  const wsClient = useRef<VehicleDetectionWebSocket | null>(null);
+  const processingRef = useRef<any>(false);
+  const fpsCounterRef = useRef({ count: 0, lastTime: Date.now() });
+  
+  // Track unique vehicles by track_id
+  const seenTrackIds = useRef<Set<number>>(new Set());
+  
+  // Session tracking
+  const sessionStartTime = useRef<number | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveSuccess, setSaveSuccess] = useState(false);
+
+  // Initialize WebSocket connection
+  useEffect(() => {
+    const initWebSocket = async () => {
+      try {
+        wsClient.current = new VehicleDetectionWebSocket('ws://localhost:8000/ws');
+        await wsClient.current.connect();
+        
+        // Test connection
+        const testResult = await wsClient.current.testConnection();
+        console.log('✅ WebSocket connected:', testResult);
+        setIsConnected(true);
+        setFeedError(null);
+      } catch (error) {
+        console.error('❌ WebSocket connection failed:', error);
+        setIsConnected(false);
+        setFeedError('Failed to connect to detection server. Make sure the backend is running on localhost:8000');
+      }
+    };
+
+    initWebSocket();
+
+    return () => {
+      if (wsClient.current) {
+        wsClient.current.close();
+      }
+    };
+  }, []);
+
+  // Handle file selection
+  const handleFileSelect = (file: File) => {
+    setSelectedFile(file);
+    setVehicleCounts({ cars: 0, truckBus: 0, motorcycle: 0 });
+    setDetections([]);
+    setFps(0);
+    setInsights([]);
+    setSaveSuccess(false);
+    
+    // Reset track IDs and session
+    seenTrackIds.current.clear();
+    sessionStartTime.current = null;
+    
+    // Create video URL for display
+    if (videoSrc) {
+      URL.revokeObjectURL(videoSrc);
+    }
+    const url = URL.createObjectURL(file);
+    setVideoSrc(url);
+  };
+  
+  // Cleanup video URL on unmount
+  useEffect(() => {
+    return () => {
+      if (videoSrc) {
+        URL.revokeObjectURL(videoSrc);
+      }
+    };
+  }, [videoSrc]);
+
+  // Start live streaming (like camera)
+  const handleStartProcessing = () => {
+    if (!wsClient.current || !wsClient.current.isConnected()) {
+      setFeedError('Please ensure WebSocket is connected');
+      return;
+    }
+
+    // Get video element from DetectionFeed
+    const videoElement = document.querySelector('video') as HTMLVideoElement;
+    if (!videoElement) {
+      setFeedError('Video element not found');
+      return;
+    }
+
+    // Play video when starting detection
+    videoElement.play().catch(err => {
+      console.error('Error playing video:', err);
+    });
+
+    setIsProcessing(true);
+    setIsLoading(false);
+    setSaveSuccess(false);
+    fpsCounterRef.current = { count: 0, lastTime: Date.now() };
+    
+    // Start session timer
+    sessionStartTime.current = Date.now();
+
+    // Import startLiveStream function
+    import('@/lib/websocket').then(({ startLiveStream }) => {
+      const stopStream = startLiveStream(
+        videoElement,
+        wsClient.current!,
+        (response, videoDimensions) => {
+          // Convert backend detections to frontend format
+          // Coordinates from backend are already in video's natural resolution
+          const frontendDetections = response.detections.map(det =>
+            convertBackendDetection(det, response.timestamp)
+          );
+
+          setDetections(frontendDetections);
+
+          // Update vehicle counts - only count NEW track_ids (unique vehicles)
+          let hasNewVehicles = false;
+          const newCounts = { cars: 0, truckBus: 0, motorcycle: 0 };
+          
+          frontendDetections.forEach(det => {
+            // Only count if this track_id hasn't been seen before
+            if (det.track_id && !seenTrackIds.current.has(det.track_id)) {
+              seenTrackIds.current.add(det.track_id);
+              hasNewVehicles = true;
+              
+              console.log(`🚗 New vehicle detected! Track ID: ${det.track_id}, Type: ${det.category}`);
+              
+              // Count by category
+              if (det.category === 'cars') newCounts.cars += 1;
+              else if (det.category === 'truck-bus') newCounts.truckBus += 1;
+              else if (det.category === 'motorcycle') newCounts.motorcycle += 1;
+            }
+          });
+          
+          // Update state if there are new vehicles
+          if (hasNewVehicles) {
+            setVehicleCounts(prev => ({
+              cars: prev.cars + newCounts.cars,
+              truckBus: prev.truckBus + newCounts.truckBus,
+              motorcycle: prev.motorcycle + newCounts.motorcycle,
+            }));
+            console.log(`📊 Updated counts: Cars +${newCounts.cars}, Trucks +${newCounts.truckBus}, Motorcycles +${newCounts.motorcycle}`);
+          }
+
+          // Calculate FPS (capped at 30)
+          fpsCounterRef.current.count++;
+          const now = Date.now();
+          const elapsed = now - fpsCounterRef.current.lastTime;
+          if (elapsed >= 1000) {
+            const currentFps = Math.min((fpsCounterRef.current.count * 1000) / elapsed, 30);
+            setFps(currentFps);
+            fpsCounterRef.current = { count: 0, lastTime: now };
+          }
+        },
+        30 // Target 30 FPS max
+      );
+
+      // Store stop function
+      processingRef.current = stopStream as any;
+    });
+  };
+
+  // Stop processing
+  const handleStopProcessing = () => {
+    // Pause video when stopping detection
+    const videoElement = document.querySelector('video') as HTMLVideoElement;
+    if (videoElement) {
+      videoElement.pause();
+    }
+
+    if (typeof processingRef.current === 'function') {
+      processingRef.current(); // Call stop function
+    }
+    processingRef.current = false;
+    setIsProcessing(false);
+    setFps(0);
+  };
+  
+  // Save session to local storage
+  const handleSaveSession = () => {
+    if (!sessionStartTime.current) {
+      console.warn('No session to save');
+      return;
+    }
+    
+    setIsSaving(true);
+    
+    try {
+      const duration = Math.floor((Date.now() - sessionStartTime.current) / 1000);
+      const totalVehicles = vehicleCounts.cars + vehicleCounts.truckBus + vehicleCounts.motorcycle;
+      
+      // Calculate average FPS (use last known FPS or 0)
+      const averageFps = fps;
+      
+      // Get video info if available
+      const videoElement = document.querySelector('video') as HTMLVideoElement;
+      const videoInfo = selectedFile ? {
+        fileName: selectedFile.name,
+        fileSize: selectedFile.size,
+        duration: videoElement?.duration || 0,
+      } : undefined;
+      
+      // Save to localStorage
+      const sessionId = SessionStorage.saveSession({
+        duration,
+        counts: vehicleCounts,
+        totalVehicles,
+        averageFps,
+        insights,
+        videoInfo,
+        trackIds: Array.from(seenTrackIds.current),
+      });
+      
+      console.log('✅ Session saved successfully:', sessionId);
+      setSaveSuccess(true);
+      
+      // Reset success message after 3 seconds
+      setTimeout(() => {
+        setSaveSuccess(false);
+      }, 3000);
+    } catch (error) {
+      console.error('❌ Failed to save session:', error);
+      setFeedError('Failed to save session to local storage');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Retry connection
+  const handleRetry = async () => {
+    setFeedError(null);
+    setIsLoading(true);
+    
+    try {
+      if (wsClient.current) {
+        await wsClient.current.connect();
+        setIsConnected(true);
+        setFeedError(null);
+      }
+    } catch (error) {
+      setFeedError('Failed to reconnect. Please check if the backend server is running.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Generate AI insight on demand
+  const handleGenerateInsight = () => {
+    setIsGeneratingInsight(true);
+    
+    // Simulate AI processing time
+    setTimeout(() => {
+      const newInsight = generateInsight(vehicleCounts);
+      setInsights((prevInsights) => [newInsight, ...prevInsights]);
+      setIsGeneratingInsight(false);
+    }, 1000);
+  };
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <main className="h-[calc(100vh-4rem)] bg-background overflow-hidden">
+      {/* Main container - Fully responsive, no scroll on zoom */}
+      <div className="h-full flex flex-col lg:flex-row gap-3 p-3 lg:p-4 min-h-0">
+        {/* Left side: Video feed and insights (YouTube style) - Takes remaining space */}
+        <div className="flex-1 flex flex-col gap-2 min-h-0 min-w-0 overflow-hidden">
+          {/* Video Feed - Auto-adjusts to available width */}
+          <section aria-label="Live detection feed" className="flex-shrink-0">
+            <ErrorBoundary>
+              <DetectionFeed 
+                detections={detections} 
+                fps={fps} 
+                isLoading={isLoading}
+                error={feedError}
+                onRetry={handleRetry}
+                videoSrc={videoSrc}
+              />
+            </ErrorBoundary>
+          </section>
+
+          {/* Title and Connection Status */}
+          <div className="flex-shrink-0 flex items-center justify-between">
+            <h1 className="text-sm lg:text-base font-bold text-foreground leading-tight">
+              Vehicle Counter - Live Detection
+            </h1>
+            <div className="flex items-center gap-2">
+              {isConnected ? (
+                <div className="flex items-center gap-1.5 text-xs text-green-600 dark:text-green-400">
+                  <Wifi className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">Connected</span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5 text-xs text-destructive">
+                  <WifiOff className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">Disconnected</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* AI Insights Section - Takes remaining vertical space */}
+          <section aria-label="AI insights" className="flex-1 min-h-0 overflow-hidden">
+            <ErrorBoundary>
+              <InsightPanel 
+                insights={insights} 
+                maxVisible={10}
+                onGenerateInsight={handleGenerateInsight}
+                isGenerating={isGeneratingInsight}
+              />
+            </ErrorBoundary>
+          </section>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+
+        {/* Right sidebar: Upload and Stats */}
+        <aside 
+          className="w-full lg:w-60 xl:w-64 2xl:w-72 flex-shrink-0 lg:border-l border-border overflow-y-auto" 
+          aria-label="Controls and Statistics"
+        >
+          <div className="space-y-3">
+            {/* Video Upload */}
+            <ErrorBoundary>
+              <VideoUpload
+                onFileSelect={handleFileSelect}
+                onStart={handleStartProcessing}
+                onStop={handleStopProcessing}
+                isProcessing={isProcessing}
+                progress={0}
+                disabled={!isConnected}
+              />
+            </ErrorBoundary>
+
+            {/* Vehicle Counter */}
+            <ErrorBoundary>
+              {isLoading ? (
+                <VehicleCounterSkeleton />
+              ) : (
+                <VehicleCounter counts={vehicleCounts} />
+              )}
+            </ErrorBoundary>
+            
+            {/* Save Session Button */}
+            {sessionStartTime.current && !isProcessing && (
+              <div className="rounded-lg border border-border bg-card p-3">
+                <button
+                  onClick={handleSaveSession}
+                  disabled={isSaving || saveSuccess}
+                  className={`w-full flex items-center justify-center gap-2 px-4 py-2 rounded-md font-medium transition-colors ${
+                    saveSuccess
+                      ? 'bg-green-600 text-white cursor-default'
+                      : 'bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50'
+                  }`}
+                  aria-label="Save detection session"
+                >
+                  <Save className="h-4 w-4" aria-hidden="true" />
+                  {isSaving ? 'Saving...' : saveSuccess ? 'Saved!' : 'Save Session'}
+                </button>
+                {saveSuccess && (
+                  <p className="text-xs text-green-600 dark:text-green-400 mt-2 text-center">
+                    Session saved to local storage
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        </aside>
+      </div>
+    </main>
   );
 }
