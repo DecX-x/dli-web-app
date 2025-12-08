@@ -8,7 +8,7 @@ import { VideoUpload } from '@/components/upload/VideoUpload';
 import { Detection, convertBackendDetection } from '@/types/detection';
 import { VehicleCounts } from '@/types/session';
 import { Insight } from '@/types/insight';
-import { generateInsight } from '@/lib/mockData';
+import { getAIInsight } from '@/lib/insights';
 import { ErrorBoundary } from '@/components/error/ErrorBoundary';
 import { VehicleCounterSkeleton } from '@/components/loading/SkeletonLoader';
 import { VehicleDetectionWebSocket } from '@/lib/websocket';
@@ -220,8 +220,8 @@ export default function Home() {
     setFps(0);
   };
   
-  // Save session to local storage
-  const handleSaveSession = () => {
+  // Save session to MongoDB
+  const handleSaveSession = async () => {
     if (!sessionStartTime.current) {
       console.warn('No session to save');
       return;
@@ -244,8 +244,8 @@ export default function Home() {
         duration: videoElement?.duration || 0,
       } : undefined;
       
-      // Save to localStorage
-      const sessionId = SessionStorage.saveSession({
+      // Save to MongoDB via API
+      const sessionId = await SessionStorage.saveSession({
         duration,
         counts: vehicleCounts,
         totalVehicles,
@@ -264,7 +264,7 @@ export default function Home() {
       }, 3000);
     } catch (error) {
       console.error('❌ Failed to save session:', error);
-      setFeedError('Failed to save session to local storage');
+      setFeedError('Failed to save session to database');
     } finally {
       setIsSaving(false);
     }
@@ -289,37 +289,33 @@ export default function Home() {
   };
 
   // Generate AI insight on demand
-  const handleGenerateInsight = () => {
+  const handleGenerateInsight = async () => {
     setIsGeneratingInsight(true);
     
-    // Simulate AI processing time
-    setTimeout(() => {
-      const newInsight = generateInsight(vehicleCounts);
+    try {
+      // Calculate duration since session started
+      const duration = sessionStartTime.current 
+        ? Math.floor((Date.now() - sessionStartTime.current) / 1000)
+        : 0;
+      
+      // Call AI insights API
+      const newInsight = await getAIInsight(vehicleCounts, duration, fps);
       setInsights((prevInsights) => [newInsight, ...prevInsights]);
+      
+      console.log('✅ AI Insight generated:', newInsight.message);
+    } catch (error) {
+      console.error('❌ Failed to generate AI insight:', error);
+    } finally {
       setIsGeneratingInsight(false);
-    }, 1000);
+    }
   };
 
   return (
-    <main className="h-[calc(100vh-4rem)] bg-background overflow-hidden">
-      {/* Main container - Fully responsive, no scroll on zoom */}
-      <div className="h-full flex flex-col lg:flex-row gap-3 p-3 lg:p-4 min-h-0">
-        {/* Left side: Video feed and insights (YouTube style) - Takes remaining space */}
-        <div className="flex-1 flex flex-col gap-2 min-h-0 min-w-0 overflow-hidden">
-          {/* Video Feed - Auto-adjusts to available width */}
-          <section aria-label="Live detection feed" className="flex-shrink-0">
-            <ErrorBoundary>
-              <DetectionFeed 
-                detections={detections} 
-                fps={fps} 
-                isLoading={isLoading}
-                error={feedError}
-                onRetry={handleRetry}
-                videoSrc={videoSrc}
-              />
-            </ErrorBoundary>
-          </section>
-
+    <main className="min-h-[calc(100vh-4rem)] bg-background overflow-y-auto">
+      {/* Main container - Scrollable layout */}
+      <div className="flex flex-col lg:flex-row gap-3 p-3 lg:p-4">
+        {/* Left side: Video feed and insights */}
+        <div className="flex-1 flex flex-col gap-2 min-w-0">
           {/* Title and Connection Status */}
           <div className="flex-shrink-0 flex items-center justify-between">
             <h1 className="text-sm lg:text-base font-bold text-foreground leading-tight">
@@ -340,8 +336,22 @@ export default function Home() {
             </div>
           </div>
 
-          {/* AI Insights Section - Takes remaining vertical space */}
-          <section aria-label="AI insights" className="flex-1 min-h-0 overflow-hidden">
+          {/* Video Feed - Full width, natural aspect ratio */}
+          <section aria-label="Live detection feed">
+            <ErrorBoundary>
+              <DetectionFeed 
+                detections={detections} 
+                fps={fps} 
+                isLoading={isLoading}
+                error={feedError}
+                onRetry={handleRetry}
+                videoSrc={videoSrc}
+              />
+            </ErrorBoundary>
+          </section>
+
+          {/* AI Insights Section */}
+          <section aria-label="AI insights" className="min-h-[200px]">
             <ErrorBoundary>
               <InsightPanel 
                 insights={insights} 
@@ -398,7 +408,7 @@ export default function Home() {
                 </button>
                 {saveSuccess && (
                   <p className="text-xs text-green-600 dark:text-green-400 mt-2 text-center">
-                    Session saved to local storage
+                    Session saved to database
                   </p>
                 )}
               </div>

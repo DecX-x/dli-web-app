@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { DetectionSession } from '@/types/session';
 import { generateHistoricalSessions } from '@/lib/mockData';
 import { SessionStorage } from '@/lib/storage';
@@ -14,22 +14,21 @@ import { RefreshCw, Trash2, Database } from 'lucide-react';
 /**
  * Data page for viewing historical detection sessions
  * Requirements: 4.1, 4.2, 4.5
- * Now loads from localStorage instead of mock data
+ * Now loads from MongoDB via API
  */
 
 export default function DataPage() {
   const [sessions, setSessions] = useState<DetectionSession[]>([]);
   const [selectedSession, setSelectedSession] = useState<DetectionSession | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [storageStats, setStorageStats] = useState({ totalSessions: 0, totalVehicles: 0, storageSize: 0 });
+  const [storageStats, setStorageStats] = useState({ totalSessions: 0, totalVehicles: 0 });
 
-  // Load sessions from localStorage
-  const loadSessions = () => {
+  // Load sessions from MongoDB
+  const loadSessions = useCallback(async () => {
     setIsLoading(true);
     
-    // Simulate loading delay for better UX
-    setTimeout(() => {
-      const storedSessions = SessionStorage.getAllDetectionSessions();
+    try {
+      const storedSessions = await SessionStorage.getAllDetectionSessions();
       
       // If no stored sessions, optionally generate mock data for demo
       if (storedSessions.length === 0) {
@@ -40,17 +39,22 @@ export default function DataPage() {
       }
       
       // Update storage stats
-      const stats = SessionStorage.getStats();
+      const stats = await SessionStorage.getStats();
       setStorageStats(stats);
-      
+    } catch (error) {
+      console.error('Error loading sessions:', error);
+      // Fallback to mock data on error
+      const mockSessions = generateHistoricalSessions(10);
+      setSessions(mockSessions);
+    } finally {
       setIsLoading(false);
-    }, 300);
-  };
+    }
+  }, []);
 
   // Load sessions on mount
   useEffect(() => {
     loadSessions();
-  }, []);
+  }, [loadSessions]);
 
   const handleSessionSelect = (session: DetectionSession) => {
     setSelectedSession(session);
@@ -61,9 +65,9 @@ export default function DataPage() {
   };
   
   // Clear all sessions
-  const handleClearAll = () => {
+  const handleClearAll = async () => {
     if (confirm('Are you sure you want to delete all sessions? This cannot be undone.')) {
-      SessionStorage.clearAllSessions();
+      await SessionStorage.clearAllSessions();
       loadSessions();
     }
   };
@@ -77,7 +81,7 @@ export default function DataPage() {
             <div>
               <h1 className="text-3xl font-bold text-foreground">Historical Data</h1>
               <p className="text-muted-foreground mt-2">
-                View and analyze past detection sessions from local storage
+                View and analyze past detection sessions from database
               </p>
             </div>
             <div className="flex gap-2">
@@ -118,10 +122,6 @@ export default function DataPage() {
               <div>•</div>
               <div>
                 {storageStats.totalVehicles} total vehicles detected
-              </div>
-              <div>•</div>
-              <div>
-                {(storageStats.storageSize / 1024).toFixed(2)} KB used
               </div>
             </div>
           )}

@@ -1,20 +1,17 @@
 /**
- * LocalStorage service for detection sessions
- * Mimics MongoDB document structure for easy migration
+ * Session Storage Service
+ * Uses MongoDB via API routes
  */
 
 import { DetectionSession } from '@/types/session';
 import { Insight } from '@/types/insight';
 
-const STORAGE_KEY = 'vehicle_detection_sessions';
-const MAX_SESSIONS = 100; // Limit storage size
-
 /**
- * Session document structure (MongoDB-like)
+ * Session document structure (matches MongoDB schema)
  */
 export interface SessionDocument {
-  _id: string; // MongoDB-style ID
-  timestamp: string; // ISO string for serialization
+  _id: string;
+  timestamp: string;
   duration: number;
   counts: {
     cars: number;
@@ -34,19 +31,35 @@ export interface SessionDocument {
     fileSize: number;
     duration: number;
   };
-  trackIds: number[]; // List of unique track IDs seen
+  trackIds: number[];
   createdAt: string;
   updatedAt: string;
 }
 
 /**
- * Storage service class
+ * API Response types
+ */
+interface ApiResponse<T> {
+  success: boolean;
+  data?: T;
+  error?: string;
+  total?: number;
+  stats?: {
+    totalVehicles: number;
+    totalSessions: number;
+  };
+}
+
+/**
+ * Storage service class - MongoDB via API
  */
 export class SessionStorage {
+  private static baseUrl = '/api/sessions';
+
   /**
-   * Save a new session to localStorage
+   * Save a new session to MongoDB
    */
-  static saveSession(session: {
+  static async saveSession(session: {
     duration: number;
     counts: { cars: number; truckBus: number; motorcycle: number };
     totalVehicles: number;
@@ -54,44 +67,32 @@ export class SessionStorage {
     insights: Insight[];
     videoInfo?: { fileName: string; fileSize: number; duration: number };
     trackIds: number[];
-  }): string {
+  }): Promise<string> {
     try {
-      const sessions = this.getAllSessions();
-      
-      // Create MongoDB-style document
-      const now = new Date().toISOString();
-      const sessionDoc: SessionDocument = {
-        _id: this.generateId(),
-        timestamp: now,
-        duration: session.duration,
-        counts: session.counts,
-        totalVehicles: session.totalVehicles,
-        averageFps: session.averageFps,
-        insights: session.insights.map(insight => ({
-          id: insight.id,
-          message: insight.message,
-          severity: insight.severity,
-          timestamp: insight.timestamp.toISOString(),
-        })),
-        videoInfo: session.videoInfo,
-        trackIds: session.trackIds,
-        createdAt: now,
-        updatedAt: now,
-      };
+      const response = await fetch(this.baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ...session,
+          insights: session.insights.map(insight => ({
+            id: insight.id,
+            message: insight.message,
+            severity: insight.severity,
+            timestamp: insight.timestamp.toISOString(),
+          })),
+        }),
+      });
 
-      // Add to sessions array
-      sessions.unshift(sessionDoc); // Add to beginning (newest first)
+      const result: ApiResponse<SessionDocument> = await response.json();
 
-      // Limit storage size
-      if (sessions.length > MAX_SESSIONS) {
-        sessions.splice(MAX_SESSIONS);
+      if (!result.success || !result.data) {
+        throw new Error(result.error || 'Failed to save session');
       }
 
-      // Save to localStorage
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
-      
-      console.log('✅ Session saved to localStorage:', sessionDoc._id);
-      return sessionDoc._id;
+      console.log('✅ Session saved to MongoDB:', result.data._id);
+      return result.data._id;
     } catch (error) {
       console.error('❌ Error saving session:', error);
       throw error;
@@ -99,14 +100,18 @@ export class SessionStorage {
   }
 
   /**
-   * Get all sessions from localStorage
+   * Get all sessions from MongoDB
    */
-  static getAllSessions(): SessionDocument[] {
+  static async getAllSessions(): Promise<SessionDocument[]> {
     try {
-      const data = localStorage.getItem(STORAGE_KEY);
-      if (!data) return [];
-      
-      return JSON.parse(data);
+      const response = await fetch(this.baseUrl);
+      const result: ApiResponse<SessionDocument[]> = await response.json();
+
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to fetch sessions');
+      }
+
+      return result.data || [];
     } catch (error) {
       console.error('❌ Error reading sessions:', error);
       return [];
@@ -116,9 +121,20 @@ export class SessionStorage {
   /**
    * Get session by ID
    */
-  static getSessionById(id: string): SessionDocument | null {
-    const sessions = this.getAllSessions();
-    return sessions.find(s => s._id === id) || null;
+  static async getSessionById(id: string): Promise<SessionDocument | null> {
+    try {
+      const response = await fetch(`${this.baseUrl}/${id}`);
+      const result: ApiResponse<SessionDocument> = await response.json();
+
+      if (!result.success) {
+        return null;
+      }
+
+      return result.data || null;
+    } catch (error) {
+      console.error('❌ Error fetching session:', error);
+      return null;
+    }
   }
 
   /**
@@ -144,24 +160,25 @@ export class SessionStorage {
   /**
    * Get all sessions as DetectionSession array
    */
-  static getAllDetectionSessions(): DetectionSession[] {
-    const docs = this.getAllSessions();
+  static async getAllDetectionSessions(): Promise<DetectionSession[]> {
+    const docs = await this.getAllSessions();
     return docs.map(doc => this.toDetectionSession(doc));
   }
 
   /**
    * Delete session by ID
    */
-  static deleteSession(id: string): boolean {
+  static async deleteSession(id: string): Promise<boolean> {
     try {
-      const sessions = this.getAllSessions();
-      const filtered = sessions.filter(s => s._id !== id);
-      
-      if (filtered.length === sessions.length) {
-        return false; // Session not found
+      const response = await fetch(`${this.baseUrl}/${id}`, {
+        method: 'DELETE',
+      });
+      const result: ApiResponse<null> = await response.json();
+
+      if (!result.success) {
+        return false;
       }
 
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(filtered));
       console.log('✅ Session deleted:', id);
       return true;
     } catch (error) {
@@ -173,10 +190,16 @@ export class SessionStorage {
   /**
    * Clear all sessions
    */
-  static clearAllSessions(): void {
+  static async clearAllSessions(): Promise<void> {
     try {
-      localStorage.removeItem(STORAGE_KEY);
-      console.log('✅ All sessions cleared');
+      const response = await fetch(this.baseUrl, {
+        method: 'DELETE',
+      });
+      const result = await response.json();
+
+      if (result.success) {
+        console.log('✅ All sessions cleared');
+      }
     } catch (error) {
       console.error('❌ Error clearing sessions:', error);
     }
@@ -185,58 +208,18 @@ export class SessionStorage {
   /**
    * Get storage statistics
    */
-  static getStats(): {
+  static async getStats(): Promise<{
     totalSessions: number;
     totalVehicles: number;
-    storageSize: number;
-  } {
-    const sessions = this.getAllSessions();
-    const totalVehicles = sessions.reduce((sum, s) => sum + s.totalVehicles, 0);
-    const storageSize = new Blob([localStorage.getItem(STORAGE_KEY) || '']).size;
+  }> {
+    try {
+      const response = await fetch(this.baseUrl);
+      const result: ApiResponse<SessionDocument[]> = await response.json();
 
-    return {
-      totalSessions: sessions.length,
-      totalVehicles,
-      storageSize,
-    };
-  }
-
-  /**
-   * Generate MongoDB-style ObjectId
-   */
-  private static generateId(): string {
-    const timestamp = Math.floor(Date.now() / 1000).toString(16);
-    const random = Math.random().toString(16).substring(2, 18);
-    return timestamp + random;
-  }
-
-  /**
-   * Query sessions (MongoDB-like)
-   */
-  static query(filter: {
-    startDate?: Date;
-    endDate?: Date;
-    minVehicles?: number;
-    maxVehicles?: number;
-  }): SessionDocument[] {
-    let sessions = this.getAllSessions();
-
-    if (filter.startDate) {
-      sessions = sessions.filter(s => new Date(s.timestamp) >= filter.startDate!);
+      return result.stats || { totalSessions: 0, totalVehicles: 0 };
+    } catch (error) {
+      console.error('❌ Error getting stats:', error);
+      return { totalSessions: 0, totalVehicles: 0 };
     }
-
-    if (filter.endDate) {
-      sessions = sessions.filter(s => new Date(s.timestamp) <= filter.endDate!);
-    }
-
-    if (filter.minVehicles !== undefined) {
-      sessions = sessions.filter(s => s.totalVehicles >= filter.minVehicles!);
-    }
-
-    if (filter.maxVehicles !== undefined) {
-      sessions = sessions.filter(s => s.totalVehicles <= filter.maxVehicles!);
-    }
-
-    return sessions;
   }
 }
