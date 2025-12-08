@@ -56,7 +56,12 @@ export default function Home() {
   // Session tracking
   const sessionStartTime = useRef<number | null>(null);
   const autoSaveIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const currentSessionIdRef = useRef<string | null>(null);
+  
+  // Refs to store latest values for auto-save (to avoid stale closure)
+  const vehicleCountsRef = useRef<VehicleCounts>({ cars: 0, truckBus: 0, motorcycle: 0 });
+  const fpsRef = useRef<number>(0);
+  const insightsRef = useRef<Insight[]>([]);
+  const selectedFileRef = useRef<File | null>(null);
 
   // Initialize WebSocket connection
   useEffect(() => {
@@ -86,6 +91,23 @@ export default function Home() {
     };
   }, []);
 
+  // Keep refs in sync with state
+  useEffect(() => {
+    vehicleCountsRef.current = vehicleCounts;
+  }, [vehicleCounts]);
+  
+  useEffect(() => {
+    fpsRef.current = fps;
+  }, [fps]);
+  
+  useEffect(() => {
+    insightsRef.current = insights;
+  }, [insights]);
+  
+  useEffect(() => {
+    selectedFileRef.current = selectedFile;
+  }, [selectedFile]);
+
   // Handle file selection
   const handleFileSelect = (file: File) => {
     setSelectedFile(file);
@@ -93,6 +115,11 @@ export default function Home() {
     setDetections([]);
     setFps(0);
     setInsights([]);
+    
+    // Reset refs
+    vehicleCountsRef.current = { cars: 0, truckBus: 0, motorcycle: 0 };
+    fpsRef.current = 0;
+    insightsRef.current = [];
     
     // Reset track IDs and session
     seenTrackIds.current.clear();
@@ -238,12 +265,14 @@ export default function Home() {
   // Auto-save session to MongoDB (called every 5 seconds)
   const autoSaveSession = async () => {
     if (!sessionStartTime.current) {
+      console.log('⏭️ Skipping auto-save: no session started');
       return;
     }
     
     try {
       const duration = Math.floor((Date.now() - sessionStartTime.current) / 1000);
-      const totalVehicles = vehicleCounts.cars + vehicleCounts.truckBus + vehicleCounts.motorcycle;
+      const counts = vehicleCountsRef.current;
+      const totalVehicles = counts.cars + counts.truckBus + counts.motorcycle;
       
       // Skip if no vehicles detected yet
       if (totalVehicles === 0) {
@@ -251,24 +280,27 @@ export default function Home() {
         return;
       }
       
-      // Calculate average FPS (use last known FPS or 0)
-      const averageFps = fps;
+      // Calculate average FPS (use ref value)
+      const averageFps = fpsRef.current;
       
       // Get video info if available
       const videoElement = document.querySelector('video') as HTMLVideoElement;
-      const videoInfo = selectedFile ? {
-        fileName: selectedFile.name,
-        fileSize: selectedFile.size,
+      const file = selectedFileRef.current;
+      const videoInfo = file ? {
+        fileName: file.name,
+        fileSize: file.size,
         duration: videoElement?.duration || 0,
       } : undefined;
+      
+      console.log('💾 Auto-saving session...', { counts, totalVehicles, duration });
       
       // Save to MongoDB via API
       const sessionId = await SessionStorage.saveSession({
         duration,
-        counts: vehicleCounts,
+        counts,
         totalVehicles,
         averageFps,
-        insights,
+        insights: insightsRef.current,
         videoInfo,
         trackIds: Array.from(seenTrackIds.current),
       });
