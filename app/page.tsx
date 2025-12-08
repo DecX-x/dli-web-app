@@ -13,7 +13,7 @@ import { ErrorBoundary } from '@/components/error/ErrorBoundary';
 import { VehicleCounterSkeleton } from '@/components/loading/SkeletonLoader';
 import { VehicleDetectionWebSocket } from '@/lib/websocket';
 import { SessionStorage } from '@/lib/storage';
-import { Wifi, WifiOff, Save } from 'lucide-react';
+import { Wifi, WifiOff } from 'lucide-react';
 
 /**
  * Main Dashboard Page - Live Detection View
@@ -55,8 +55,8 @@ export default function Home() {
   
   // Session tracking
   const sessionStartTime = useRef<number | null>(null);
-  const [isSaving, setIsSaving] = useState(false);
-  const [saveSuccess, setSaveSuccess] = useState(false);
+  const autoSaveIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const currentSessionIdRef = useRef<string | null>(null);
 
   // Initialize WebSocket connection
   useEffect(() => {
@@ -93,7 +93,6 @@ export default function Home() {
     setDetections([]);
     setFps(0);
     setInsights([]);
-    setSaveSuccess(false);
     
     // Reset track IDs and session
     seenTrackIds.current.clear();
@@ -107,11 +106,14 @@ export default function Home() {
     setVideoSrc(url);
   };
   
-  // Cleanup video URL on unmount
+  // Cleanup video URL and auto-save interval on unmount
   useEffect(() => {
     return () => {
       if (videoSrc) {
         URL.revokeObjectURL(videoSrc);
+      }
+      if (autoSaveIntervalRef.current) {
+        clearInterval(autoSaveIntervalRef.current);
       }
     };
   }, [videoSrc]);
@@ -137,11 +139,15 @@ export default function Home() {
 
     setIsProcessing(true);
     setIsLoading(false);
-    setSaveSuccess(false);
     fpsCounterRef.current = { count: 0, lastTime: Date.now() };
     
     // Start session timer
     sessionStartTime.current = Date.now();
+    
+    // Start auto-save interval (every 5 seconds)
+    autoSaveIntervalRef.current = setInterval(() => {
+      autoSaveSession();
+    }, 5000);
 
     // Import startLiveStream function
     import('@/lib/websocket').then(({ startLiveStream }) => {
@@ -218,20 +224,32 @@ export default function Home() {
     processingRef.current = false;
     setIsProcessing(false);
     setFps(0);
-  };
-  
-  // Save session to MongoDB
-  const handleSaveSession = async () => {
-    if (!sessionStartTime.current) {
-      console.warn('No session to save');
-      return;
+    
+    // Stop auto-save interval
+    if (autoSaveIntervalRef.current) {
+      clearInterval(autoSaveIntervalRef.current);
+      autoSaveIntervalRef.current = null;
     }
     
-    setIsSaving(true);
+    // Final save when stopping
+    autoSaveSession();
+  };
+  
+  // Auto-save session to MongoDB (called every 5 seconds)
+  const autoSaveSession = async () => {
+    if (!sessionStartTime.current) {
+      return;
+    }
     
     try {
       const duration = Math.floor((Date.now() - sessionStartTime.current) / 1000);
       const totalVehicles = vehicleCounts.cars + vehicleCounts.truckBus + vehicleCounts.motorcycle;
+      
+      // Skip if no vehicles detected yet
+      if (totalVehicles === 0) {
+        console.log('⏭️ Skipping auto-save: no vehicles detected yet');
+        return;
+      }
       
       // Calculate average FPS (use last known FPS or 0)
       const averageFps = fps;
@@ -255,18 +273,9 @@ export default function Home() {
         trackIds: Array.from(seenTrackIds.current),
       });
       
-      console.log('✅ Session saved successfully:', sessionId);
-      setSaveSuccess(true);
-      
-      // Reset success message after 3 seconds
-      setTimeout(() => {
-        setSaveSuccess(false);
-      }, 3000);
+      console.log('✅ Auto-saved session:', sessionId, `(${totalVehicles} vehicles, ${duration}s)`);
     } catch (error) {
-      console.error('❌ Failed to save session:', error);
-      setFeedError('Failed to save session to database');
-    } finally {
-      setIsSaving(false);
+      console.error('❌ Auto-save failed:', error);
     }
   };
 
@@ -390,27 +399,13 @@ export default function Home() {
               )}
             </ErrorBoundary>
             
-            {/* Save Session Button */}
-            {sessionStartTime.current && !isProcessing && (
+            {/* Auto-save indicator */}
+            {isProcessing && (
               <div className="rounded-lg border border-border bg-card p-3">
-                <button
-                  onClick={handleSaveSession}
-                  disabled={isSaving || saveSuccess}
-                  className={`w-full flex items-center justify-center gap-2 px-4 py-2 rounded-md font-medium transition-colors ${
-                    saveSuccess
-                      ? 'bg-green-600 text-white cursor-default'
-                      : 'bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50'
-                  }`}
-                  aria-label="Save detection session"
-                >
-                  <Save className="h-4 w-4" aria-hidden="true" />
-                  {isSaving ? 'Saving...' : saveSuccess ? 'Saved!' : 'Save Session'}
-                </button>
-                {saveSuccess && (
-                  <p className="text-xs text-green-600 dark:text-green-400 mt-2 text-center">
-                    Session saved to database
-                  </p>
-                )}
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+                  <span>Auto-saving every 5 seconds</span>
+                </div>
               </div>
             )}
           </div>

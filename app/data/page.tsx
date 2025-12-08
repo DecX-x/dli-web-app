@@ -28,24 +28,20 @@ export default function DataPage() {
     setIsLoading(true);
     
     try {
+      console.log('📥 Loading sessions from MongoDB...');
       const storedSessions = await SessionStorage.getAllDetectionSessions();
+      console.log('📊 Loaded sessions:', storedSessions.length);
       
-      // If no stored sessions, optionally generate mock data for demo
-      if (storedSessions.length === 0) {
-        const mockSessions = generateHistoricalSessions(10);
-        setSessions(mockSessions);
-      } else {
-        setSessions(storedSessions);
-      }
+      // Show actual data from database (no mock fallback)
+      setSessions(storedSessions);
       
       // Update storage stats
       const stats = await SessionStorage.getStats();
+      console.log('📈 Stats:', stats);
       setStorageStats(stats);
     } catch (error) {
-      console.error('Error loading sessions:', error);
-      // Fallback to mock data on error
-      const mockSessions = generateHistoricalSessions(10);
-      setSessions(mockSessions);
+      console.error('❌ Error loading sessions:', error);
+      setSessions([]);
     } finally {
       setIsLoading(false);
     }
