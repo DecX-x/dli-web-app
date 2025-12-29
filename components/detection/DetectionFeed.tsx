@@ -11,7 +11,9 @@ interface DetectionFeedProps {
   isLoading?: boolean;
   error?: string | null;
   onRetry?: () => void;
-  videoSrc?: string | null; // Video source URL
+  videoSrc?: string | null; // Video source URL (for file upload mode)
+  streamFrame?: string | null; // Base64 frame from RTSP stream
+  isRTSPMode?: boolean; // Whether in RTSP streaming mode
 }
 
 /**
@@ -24,11 +26,22 @@ interface TrackHistory {
   [trackId: number]: { x: number; y: number; timestamp: number }[];
 }
 
-export const DetectionFeed = memo(function DetectionFeed({ detections, fps, isLoading = false, error = null, onRetry, videoSrc = null }: DetectionFeedProps) {
+export const DetectionFeed = memo(function DetectionFeed({ 
+  detections, 
+  fps, 
+  isLoading = false, 
+  error = null, 
+  onRetry, 
+  videoSrc = null,
+  streamFrame = null,
+  isRTSPMode = false
+}: DetectionFeedProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const frameCanvasRef = useRef<HTMLCanvasElement>(null); // For RTSP frame rendering
   const [dimensions, setDimensions] = useState({ width: 1920, height: 1080 });
+  const [frameDimensions, setFrameDimensions] = useState({ width: 1920, height: 1080 });
   
   // Store track history for motion trails
   const trackHistory = useRef<TrackHistory>({});
@@ -72,11 +85,33 @@ export const DetectionFeed = memo(function DetectionFeed({ detections, fps, isLo
     return () => window.removeEventListener('resize', updateDimensions);
   }, []);
 
+  // Render RTSP stream frame
+  useEffect(() => {
+    if (!isRTSPMode || !streamFrame || !frameCanvasRef.current) return;
+
+    const canvas = frameCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const img = new Image();
+    img.onload = () => {
+      // Update frame dimensions
+      if (img.width !== frameDimensions.width || img.height !== frameDimensions.height) {
+        setFrameDimensions({ width: img.width, height: img.height });
+        canvas.width = img.width;
+        canvas.height = img.height;
+      }
+      
+      // Draw the frame
+      ctx.drawImage(img, 0, 0);
+    };
+    img.src = `data:image/jpeg;base64,${streamFrame}`;
+  }, [streamFrame, isRTSPMode, frameDimensions]);
+
   // Draw bounding boxes on canvas
   useEffect(() => {
     const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video) return;
+    if (!canvas) return;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
@@ -84,17 +119,26 @@ export const DetectionFeed = memo(function DetectionFeed({ detections, fps, isLo
     // Clear canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Get video's natural dimensions (actual video resolution)
-    const videoWidth = video.videoWidth || 1920;
-    const videoHeight = video.videoHeight || 1080;
+    // Get source dimensions based on mode
+    let sourceWidth: number;
+    let sourceHeight: number;
+
+    if (isRTSPMode) {
+      sourceWidth = frameDimensions.width;
+      sourceHeight = frameDimensions.height;
+    } else {
+      const video = videoRef.current;
+      sourceWidth = video?.videoWidth || 1920;
+      sourceHeight = video?.videoHeight || 1080;
+    }
 
     // Get canvas display dimensions
     const canvasWidth = canvas.width;
     const canvasHeight = canvas.height;
 
-    // Calculate scale factors from video resolution to canvas display size
-    const scaleX = canvasWidth / videoWidth;
-    const scaleY = canvasHeight / videoHeight;
+    // Calculate scale factors from source resolution to canvas display size
+    const scaleX = canvasWidth / sourceWidth;
+    const scaleY = canvasHeight / sourceHeight;
 
     // Update track history and draw trails
     const currentTime = Date.now();
@@ -224,7 +268,7 @@ export const DetectionFeed = memo(function DetectionFeed({ detections, fps, isLo
         }
       }
     });
-  }, [detections, dimensions, categoryColors, maxTrailLength]);
+  }, [detections, dimensions, frameDimensions, isRTSPMode, categoryColors, maxTrailLength]);
 
   // Show loading state
   if (isLoading) {
@@ -244,8 +288,13 @@ export const DetectionFeed = memo(function DetectionFeed({ detections, fps, isLo
       role="region"
       aria-label="Live vehicle detection feed"
     >
-      {/* Video player or placeholder */}
-      {videoSrc ? (
+      {/* Video player or RTSP canvas or placeholder */}
+      {isRTSPMode ? (
+        <canvas
+          ref={frameCanvasRef}
+          className="absolute inset-0 w-full h-full object-contain bg-black"
+        />
+      ) : videoSrc ? (
         <video
           ref={videoRef}
           src={videoSrc}
@@ -261,7 +310,7 @@ export const DetectionFeed = memo(function DetectionFeed({ detections, fps, isLo
               Live Detection Feed
             </div>
             <div className="text-muted-foreground/70 text-sm">
-              Upload a video to start detection
+              Start RTSP stream to begin detection
             </div>
           </div>
         </div>

@@ -5,7 +5,7 @@
 
 import { MongoClient, ServerApiVersion } from 'mongodb';
 
-const uri = process.env.MONGODB_URI || "mongodb+srv://mellbendlsatria_db_user:fXjfZIT7BN5skuZa@cluster0.bnugqvf.mongodb.net/?appName=Cluster0";
+const uri = process.env.MONGODB_URI || "xx";
 const dbName = process.env.MONGODB_DB_NAME || "vehicle_detection";
 const COLLECTION_NAME = 'sessions';
 

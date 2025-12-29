@@ -5,7 +5,7 @@
 
 import { MongoClient, ServerApiVersion } from 'mongodb';
 
-const uri = "mongodb+srv://mellbendlsatria_db_user:fXjfZIT7BN5skuZa@cluster0.bnugqvf.mongodb.net/?appName=Cluster0";
+const uri = "xx";
 const dbName = "vehicle_detection";
 
 async function testConnection() {

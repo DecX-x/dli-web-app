@@ -4,14 +4,14 @@ import { useState, useEffect, useRef } from 'react';
 import { DetectionFeed } from '@/components/detection/DetectionFeed';
 import { VehicleCounter } from '@/components/detection/VehicleCounter';
 import { InsightPanel } from '@/components/insights/InsightPanel';
-import { VideoUpload } from '@/components/upload/VideoUpload';
+import { RTSPStream } from '@/components/stream/RTSPStream';
 import { Detection, convertBackendDetection } from '@/types/detection';
 import { VehicleCounts } from '@/types/session';
 import { Insight } from '@/types/insight';
 import { getAIInsight } from '@/lib/insights';
 import { ErrorBoundary } from '@/components/error/ErrorBoundary';
 import { VehicleCounterSkeleton } from '@/components/loading/SkeletonLoader';
-import { VehicleDetectionWebSocket } from '@/lib/websocket';
+import { VehicleDetectionWebSocket, startRTSPStream } from '@/lib/websocket';
 import { SessionStorage } from '@/lib/storage';
 import { Wifi, WifiOff } from 'lucide-react';
 
@@ -43,11 +43,11 @@ export default function Home() {
   
   // WebSocket state
   const [isConnected, setIsConnected] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [videoSrc, setVideoSrc] = useState<string | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamFrame, setStreamFrame] = useState<string | null>(null);
+  const [streamStatus, setStreamStatus] = useState<string>('');
   const wsClient = useRef<VehicleDetectionWebSocket | null>(null);
-  const processingRef = useRef<any>(false);
+  const stopStreamRef = useRef<(() => void) | null>(null);
   const fpsCounterRef = useRef({ count: 0, lastTime: Date.now() });
   
   // Track unique vehicles by track_id
@@ -61,7 +61,6 @@ export default function Home() {
   const vehicleCountsRef = useRef<VehicleCounts>({ cars: 0, truckBus: 0, motorcycle: 0 });
   const fpsRef = useRef<number>(0);
   const insightsRef = useRef<Insight[]>([]);
-  const selectedFileRef = useRef<File | null>(null);
 
   // Initialize WebSocket connection
   useEffect(() => {
@@ -103,69 +102,46 @@ export default function Home() {
   useEffect(() => {
     insightsRef.current = insights;
   }, [insights]);
-  
-  useEffect(() => {
-    selectedFileRef.current = selectedFile;
-  }, [selectedFile]);
 
-  // Handle file selection
-  const handleFileSelect = (file: File) => {
-    setSelectedFile(file);
-    setVehicleCounts({ cars: 0, truckBus: 0, motorcycle: 0 });
-    setDetections([]);
-    setFps(0);
-    setInsights([]);
-    
-    // Reset refs
-    vehicleCountsRef.current = { cars: 0, truckBus: 0, motorcycle: 0 };
-    fpsRef.current = 0;
-    insightsRef.current = [];
-    
-    // Reset track IDs and session
-    seenTrackIds.current.clear();
-    sessionStartTime.current = null;
-    
-    // Create video URL for display
-    if (videoSrc) {
-      URL.revokeObjectURL(videoSrc);
-    }
-    const url = URL.createObjectURL(file);
-    setVideoSrc(url);
-  };
-  
-  // Cleanup video URL and auto-save interval on unmount
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (videoSrc) {
-        URL.revokeObjectURL(videoSrc);
-      }
       if (autoSaveIntervalRef.current) {
         clearInterval(autoSaveIntervalRef.current);
       }
+      if (stopStreamRef.current) {
+        stopStreamRef.current();
+      }
     };
-  }, [videoSrc]);
+  }, []);
 
-  // Start live streaming (like camera)
-  const handleStartProcessing = () => {
+  // Current camera name for session saving
+  const currentCameraName = useRef<string>('RTSP Stream');
+
+  // Start RTSP streaming
+  const handleStartStream = (rtspUrl: string, cameraName: string) => {
     if (!wsClient.current || !wsClient.current.isConnected()) {
       setFeedError('Please ensure WebSocket is connected');
       return;
     }
 
-    // Get video element from DetectionFeed
-    const videoElement = document.querySelector('video') as HTMLVideoElement;
-    if (!videoElement) {
-      setFeedError('Video element not found');
-      return;
-    }
+    // Store camera name
+    currentCameraName.current = cameraName;
 
-    // Play video when starting detection
-    videoElement.play().catch(err => {
-      console.error('Error playing video:', err);
-    });
+    // Reset state
+    setVehicleCounts({ cars: 0, truckBus: 0, motorcycle: 0 });
+    setDetections([]);
+    setFps(0);
+    setInsights([]);
+    setStreamFrame(null);
+    seenTrackIds.current.clear();
+    vehicleCountsRef.current = { cars: 0, truckBus: 0, motorcycle: 0 };
+    fpsRef.current = 0;
+    insightsRef.current = [];
 
-    setIsProcessing(true);
+    setIsStreaming(true);
     setIsLoading(false);
+    setFeedError(null);
     fpsCounterRef.current = { count: 0, lastTime: Date.now() };
     
     // Start session timer
@@ -176,81 +152,79 @@ export default function Home() {
       autoSaveSession();
     }, 5000);
 
-    // Import startLiveStream function
-    import('@/lib/websocket').then(({ startLiveStream }) => {
-      const stopStream = startLiveStream(
-        videoElement,
-        wsClient.current!,
-        (response, videoDimensions) => {
-          // Convert backend detections to frontend format
-          // Coordinates from backend are already in video's natural resolution
-          const frontendDetections = response.detections.map(det =>
-            convertBackendDetection(det, response.timestamp)
-          );
+    // Start RTSP stream
+    const stopStream = startRTSPStream(
+      wsClient.current,
+      rtspUrl,
+      // On frame received
+      (frame, detections, timestamp) => {
+        setStreamFrame(frame);
+        
+        // Convert backend detections to frontend format
+        const frontendDetections = detections.map(det =>
+          convertBackendDetection(det, timestamp)
+        );
+        setDetections(frontendDetections);
 
-          setDetections(frontendDetections);
-
-          // Update vehicle counts - only count NEW track_ids (unique vehicles)
-          let hasNewVehicles = false;
-          const newCounts = { cars: 0, truckBus: 0, motorcycle: 0 };
-          
-          frontendDetections.forEach(det => {
-            // Only count if this track_id hasn't been seen before
-            if (det.track_id && !seenTrackIds.current.has(det.track_id)) {
-              seenTrackIds.current.add(det.track_id);
-              hasNewVehicles = true;
-              
-              console.log(`🚗 New vehicle detected! Track ID: ${det.track_id}, Type: ${det.category}`);
-              
-              // Count by category
-              if (det.category === 'cars') newCounts.cars += 1;
-              else if (det.category === 'truck-bus') newCounts.truckBus += 1;
-              else if (det.category === 'motorcycle') newCounts.motorcycle += 1;
-            }
-          });
-          
-          // Update state if there are new vehicles
-          if (hasNewVehicles) {
-            setVehicleCounts(prev => ({
-              cars: prev.cars + newCounts.cars,
-              truckBus: prev.truckBus + newCounts.truckBus,
-              motorcycle: prev.motorcycle + newCounts.motorcycle,
-            }));
-            console.log(`📊 Updated counts: Cars +${newCounts.cars}, Trucks +${newCounts.truckBus}, Motorcycles +${newCounts.motorcycle}`);
+        // Update vehicle counts - only count NEW track_ids
+        let hasNewVehicles = false;
+        const newCounts = { cars: 0, truckBus: 0, motorcycle: 0 };
+        
+        frontendDetections.forEach(det => {
+          if (det.track_id && !seenTrackIds.current.has(det.track_id)) {
+            seenTrackIds.current.add(det.track_id);
+            hasNewVehicles = true;
+            
+            if (det.category === 'cars') newCounts.cars += 1;
+            else if (det.category === 'truck-bus') newCounts.truckBus += 1;
+            else if (det.category === 'motorcycle') newCounts.motorcycle += 1;
           }
+        });
+        
+        if (hasNewVehicles) {
+          setVehicleCounts(prev => ({
+            cars: prev.cars + newCounts.cars,
+            truckBus: prev.truckBus + newCounts.truckBus,
+            motorcycle: prev.motorcycle + newCounts.motorcycle,
+          }));
+        }
 
-          // Calculate FPS (capped at 30)
-          fpsCounterRef.current.count++;
-          const now = Date.now();
-          const elapsed = now - fpsCounterRef.current.lastTime;
-          if (elapsed >= 1000) {
-            const currentFps = Math.min((fpsCounterRef.current.count * 1000) / elapsed, 30);
-            setFps(currentFps);
-            fpsCounterRef.current = { count: 0, lastTime: now };
-          }
-        },
-        30 // Target 30 FPS max
-      );
+        // Calculate FPS
+        fpsCounterRef.current.count++;
+        const now = Date.now();
+        const elapsed = now - fpsCounterRef.current.lastTime;
+        if (elapsed >= 1000) {
+          const currentFps = Math.min((fpsCounterRef.current.count * 1000) / elapsed, 30);
+          setFps(currentFps);
+          fpsCounterRef.current = { count: 0, lastTime: now };
+        }
+      },
+      // On error
+      (error) => {
+        console.error('❌ RTSP Stream error:', error);
+        setFeedError(error);
+        handleStopStream();
+      },
+      // On status
+      (status) => {
+        console.log('📡 RTSP Status:', status);
+        setStreamStatus(status);
+      }
+    );
 
-      // Store stop function
-      processingRef.current = stopStream as any;
-    });
+    stopStreamRef.current = stopStream;
   };
 
-  // Stop processing
-  const handleStopProcessing = () => {
-    // Pause video when stopping detection
-    const videoElement = document.querySelector('video') as HTMLVideoElement;
-    if (videoElement) {
-      videoElement.pause();
+  // Stop RTSP streaming
+  const handleStopStream = () => {
+    if (stopStreamRef.current) {
+      stopStreamRef.current();
+      stopStreamRef.current = null;
     }
-
-    if (typeof processingRef.current === 'function') {
-      processingRef.current(); // Call stop function
-    }
-    processingRef.current = false;
-    setIsProcessing(false);
+    
+    setIsStreaming(false);
     setFps(0);
+    setStreamStatus('');
     
     // Stop auto-save interval
     if (autoSaveIntervalRef.current) {
@@ -265,7 +239,6 @@ export default function Home() {
   // Auto-save session to MongoDB (called every 5 seconds)
   const autoSaveSession = async () => {
     if (!sessionStartTime.current) {
-      console.log('⏭️ Skipping auto-save: no session started');
       return;
     }
     
@@ -276,21 +249,10 @@ export default function Home() {
       
       // Skip if no vehicles detected yet
       if (totalVehicles === 0) {
-        console.log('⏭️ Skipping auto-save: no vehicles detected yet');
         return;
       }
       
-      // Calculate average FPS (use ref value)
       const averageFps = fpsRef.current;
-      
-      // Get video info if available
-      const videoElement = document.querySelector('video') as HTMLVideoElement;
-      const file = selectedFileRef.current;
-      const videoInfo = file ? {
-        fileName: file.name,
-        fileSize: file.size,
-        duration: videoElement?.duration || 0,
-      } : undefined;
       
       console.log('💾 Auto-saving session...', { counts, totalVehicles, duration });
       
@@ -301,11 +263,15 @@ export default function Home() {
         totalVehicles,
         averageFps,
         insights: insightsRef.current,
-        videoInfo,
+        videoInfo: {
+          fileName: currentCameraName.current,
+          fileSize: 0,
+          duration: duration,
+        },
         trackIds: Array.from(seenTrackIds.current),
       });
       
-      console.log('✅ Auto-saved session:', sessionId, `(${totalVehicles} vehicles, ${duration}s)`);
+      console.log('✅ Auto-saved session:', sessionId);
     } catch (error) {
       console.error('❌ Auto-save failed:', error);
     }
@@ -386,7 +352,8 @@ export default function Home() {
                 isLoading={isLoading}
                 error={feedError}
                 onRetry={handleRetry}
-                videoSrc={videoSrc}
+                streamFrame={streamFrame}
+                isRTSPMode={isStreaming || !!streamFrame}
               />
             </ErrorBoundary>
           </section>
@@ -410,17 +377,22 @@ export default function Home() {
           aria-label="Controls and Statistics"
         >
           <div className="space-y-3">
-            {/* Video Upload */}
+            {/* RTSP Stream Control */}
             <ErrorBoundary>
-              <VideoUpload
-                onFileSelect={handleFileSelect}
-                onStart={handleStartProcessing}
-                onStop={handleStopProcessing}
-                isProcessing={isProcessing}
-                progress={0}
+              <RTSPStream
+                onStart={handleStartStream}
+                onStop={handleStopStream}
+                isStreaming={isStreaming}
                 disabled={!isConnected}
               />
             </ErrorBoundary>
+
+            {/* Stream Status */}
+            {streamStatus && (
+              <div className="rounded-lg border border-border bg-card p-3">
+                <p className="text-xs text-muted-foreground">{streamStatus}</p>
+              </div>
+            )}
 
             {/* Vehicle Counter */}
             <ErrorBoundary>
@@ -432,7 +404,7 @@ export default function Home() {
             </ErrorBoundary>
             
             {/* Auto-save indicator */}
-            {isProcessing && (
+            {isStreaming && (
               <div className="rounded-lg border border-border bg-card p-3">
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />

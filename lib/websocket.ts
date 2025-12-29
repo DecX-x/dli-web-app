@@ -250,3 +250,106 @@ export function startLiveStream(
     isStreaming = false;
   };
 }
+
+
+/**
+ * Start RTSP stream via Next.js API proxy
+ * 1. Next.js API reads RTSP stream with FFmpeg
+ * 2. Sends frames to frontend via SSE
+ * 3. Frontend sends frames to backend WebSocket for detection
+ * 4. Backend returns detections
+ */
+export function startRTSPStream(
+  wsClient: VehicleDetectionWebSocket,
+  rtspUrl: string,
+  onFrame: (frame: string, detections: VehicleDetection[], timestamp: number) => void,
+  onError: (error: string) => void,
+  onStatus: (status: string) => void
+): () => void {
+  if (!wsClient.isConnected()) {
+    onError('WebSocket not connected');
+    return () => {};
+  }
+
+  let isStreaming = true;
+  let eventSource: EventSource | null = null;
+  let frameQueue: string[] = [];
+  let isProcessing = false;
+
+  onStatus('Connecting to RTSP stream via proxy...');
+
+  // Connect to Next.js RTSP proxy API
+  const apiUrl = `/api/rtsp?url=${encodeURIComponent(rtspUrl)}&id=${Date.now()}`;
+  eventSource = new EventSource(apiUrl);
+
+  eventSource.onopen = () => {
+    onStatus('Connected to RTSP stream');
+  };
+
+  eventSource.onmessage = async (event) => {
+    if (!isStreaming) return;
+
+    try {
+      const data = JSON.parse(event.data);
+      
+      if (data.error) {
+        onError(data.error);
+        return;
+      }
+
+      if (data.frame) {
+        // Add frame to queue
+        frameQueue.push(data.frame);
+        
+        // Process queue (send to backend for detection)
+        if (!isProcessing && frameQueue.length > 0) {
+          isProcessing = true;
+          
+          const frame = frameQueue.shift()!;
+          // Clear queue to avoid lag (only process latest frames)
+          if (frameQueue.length > 2) {
+            frameQueue = frameQueue.slice(-1);
+          }
+          
+          try {
+            // Send frame to backend WebSocket for detection
+            const response = await wsClient.sendFrame(frame);
+            
+            if (response.detections) {
+              onFrame(frame, response.detections, data.timestamp || Date.now());
+            }
+          } catch (err) {
+            console.error('Detection error:', err);
+          }
+          
+          isProcessing = false;
+        }
+      }
+    } catch (error) {
+      console.error('Error parsing SSE message:', error);
+    }
+  };
+
+  eventSource.onerror = (error) => {
+    console.error('SSE error:', error);
+    if (isStreaming) {
+      onError('RTSP stream connection lost. Make sure FFmpeg is installed.');
+    }
+  };
+
+  // Return stop function
+  return () => {
+    isStreaming = false;
+    frameQueue = [];
+    
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+    
+    // Call DELETE to stop FFmpeg process
+    fetch(`/api/rtsp?id=${Date.now()}`, { method: 'DELETE' }).catch(() => {});
+    
+    onStatus('Stream stopped');
+  };
+}
